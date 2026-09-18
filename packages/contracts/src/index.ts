@@ -59,12 +59,19 @@ export const chapterBlockCreateSchema = z
   })
   .strict();
 
+export const playbackTicketCreateSchema = z
+  .object({
+    recordingId: z.string().uuid(),
+  })
+  .strict();
+
 export type Role = z.infer<typeof roleSchema>;
 export type ClipInput = z.infer<typeof clipSchema>;
 export type ClipUpdateInput = z.infer<typeof clipUpdateSchema>;
 export type ChapterCreateInput = z.infer<typeof chapterCreateSchema>;
 export type ChapterUpdateInput = z.infer<typeof chapterUpdateSchema>;
 export type ChapterBlockCreateInput = z.infer<typeof chapterBlockCreateSchema>;
+export type PlaybackTicketCreateInput = z.infer<typeof playbackTicketCreateSchema>;
 
 export const apiError = (code: string, message: string, details?: unknown) => ({
   error: { code, message, details },

@@ -6,7 +6,6 @@ import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import { Prisma, PrismaClient, Role } from '@prisma/client';
 import argon2 from 'argon2';
-import { createReadStream } from 'node:fs';
 import { createWriteStream } from 'node:fs';
 import { mkdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -23,21 +22,30 @@ import {
   clipSchema,
   clipUpdateSchema,
 } from '@history/contracts';
+import { HttpError } from './errors.js';
+import { RedisTicketStore } from './playback/ticket-store.js';
+import { SegmentCache } from './playback/segment-cache.js';
+import { playbackRoutes } from './playback/routes.js';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const ALLOWED_AUDIO_EXTENSIONS = /\.(aac|aiff|flac|m4a|mp3|mp4|oga|ogg|opus|wav|webm)$/i;
 const DEFAULT_JWT_SECRET = 'development-secret-change-me-development';
+const SEGMENT_CACHE_SEGMENT_BYTES = parsePositiveInt(process.env.SEGMENT_CACHE_SEGMENT_BYTES, 1024 * 1024);
+const SEGMENT_CACHE_MAX_BYTES = parsePositiveInt(
+  process.env.SEGMENT_CACHE_MAX_BYTES,
+  256 * 1024 * 1024,
+);
+const PLAYBACK_TICKET_TTL_SECONDS = parsePositiveInt(process.env.PLAYBACK_TICKET_TTL_SECONDS, 600);
 
-class HttpError extends Error {
-  constructor(
-    public readonly statusCode: number,
-    public readonly code: string,
-    message: string,
-    public readonly details?: unknown,
-  ) {
-    super(message);
-    this.name = 'HttpError';
-  }
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+/** 从日志使用的 URL 中移除 ticket / token 查询参数，防止播放票据随日志泄露。 */
+function redactSensitiveQuery(url: string): string {
+  return url.replace(/([?&])(ticket|token)=[^&#]*/gi, '$1$2=REDACTED');
 }
 
 const registerSchema = z
@@ -78,7 +86,22 @@ const storage = path.isAbsolute(configuredStorage)
 await mkdir(storage, { recursive: true });
 
 const prisma = new PrismaClient();
-const app = Fastify({ logger: true });
+const app = Fastify({
+  logger: {
+    // 票据与 JWT 可能出现在 URL 查询串中，落日志前抹除，避免随访问日志泄露。
+    serializers: {
+      req(request: FastifyRequest) {
+        return {
+          method: request.method,
+          url: redactSensitiveQuery(request.url),
+          ...(request.headers.referer
+            ? { referer: redactSensitiveQuery(String(request.headers.referer)) }
+            : {}),
+        };
+      },
+    },
+  },
+});
 const port = Number(process.env.PORT || 4000);
 const webOrigins = (process.env.WEB_ORIGIN || process.env.APP_ORIGIN || 'http://localhost:5173')
   .split(',')
@@ -105,6 +128,29 @@ await app.register(multipart, {
   limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 20 },
 });
 await app.register(websocket);
+
+await app.register(playbackRoutes, {
+  findRecording: (id) =>
+    prisma.recording.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        workspaceId: true,
+        mimeType: true,
+        playbackPath: true,
+        originalPath: true,
+      },
+    }),
+  findMembership: (workspaceId, userId) => findMembership(workspaceId, userId),
+  authenticate,
+  authUser,
+  ticketStore: new RedisTicketStore(redis),
+  cache: new SegmentCache({
+    segmentSize: SEGMENT_CACHE_SEGMENT_BYTES,
+    maxBytes: SEGMENT_CACHE_MAX_BYTES,
+  }),
+  ticketTtlSeconds: PLAYBACK_TICKET_TTL_SECONDS,
+});
 
 function validationError<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -174,39 +220,6 @@ function recordingDto<T extends { sizeBytes: bigint }>(recording: T) {
   return { ...recording, sizeBytes: recording.sizeBytes.toString() };
 }
 
-function parseByteRange(header: string, size: number): { start: number; end: number } | null {
-  if (!header.startsWith('bytes=')) return null;
-  const value = header.slice(6).trim();
-  if (!value || value.includes(',')) return null;
-
-  const match = /^(\d*)-(\d*)$/.exec(value);
-  if (!match) return null;
-
-  const [, startText, endText] = match;
-  if (!startText && !endText) return null;
-
-  if (!startText) {
-    const suffixLength = Number(endText);
-    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
-    const start = Math.max(size - suffixLength, 0);
-    return { start, end: size - 1 };
-  }
-
-  const start = Number(startText);
-  const requestedEnd = endText ? Number(endText) : size - 1;
-  if (
-    !Number.isSafeInteger(start) ||
-    !Number.isSafeInteger(requestedEnd) ||
-    start < 0 ||
-    start >= size ||
-    requestedEnd < start
-  ) {
-    return null;
-  }
-
-  return { start, end: Math.min(requestedEnd, size - 1) };
-}
-
 async function resolveRequestUser(req: FastifyRequest): Promise<AuthUser | null> {
   const header = req.headers.authorization;
   const queryToken = typeof (req.query as { token?: unknown } | undefined)?.token === 'string'
@@ -222,7 +235,7 @@ async function resolveRequestUser(req: FastifyRequest): Promise<AuthUser | null>
   }
 }
 
-app.setErrorHandler((error, req, reply) => {
+app.setErrorHandler((error: Error, req, reply) => {
   if (error instanceof HttpError) {
     return reply.code(error.statusCode).send({
       error: { code: error.code, message: error.message, details: error.details },
@@ -487,54 +500,6 @@ app.get('/v1/workspaces/:id/recordings', { preHandler: authenticate }, async (re
     orderBy: { createdAt: 'desc' },
   });
   return { data: rows.map(recordingDto) };
-});
-
-app.get('/v1/recordings/:id/file', async (req, reply) => {
-  const recordingId = (req.params as { id: string }).id;
-  const recording = await prisma.recording.findUnique({ where: { id: recordingId } });
-  if (!recording) {
-    throw new HttpError(404, 'NOT_FOUND', '录音不存在');
-  }
-
-  const user = await resolveRequestUser(req);
-  if (!user || !(await findMembership(recording.workspaceId, user.id))) {
-    throw new HttpError(404, 'NOT_FOUND', '录音不存在');
-  }
-
-  const filePath = recording.playbackPath || recording.originalPath;
-  let fileStat;
-  try {
-    fileStat = await stat(filePath);
-  } catch {
-    throw new HttpError(404, 'FILE_NOT_FOUND', '录音文件不存在');
-  }
-
-  const rangeHeader = req.headers.range;
-  const range = rangeHeader ? parseByteRange(rangeHeader, fileStat.size) : null;
-  if (rangeHeader && !range) {
-    return reply
-      .code(416)
-      .header('Content-Range', `bytes */${fileStat.size}`)
-      .send();
-  }
-
-  reply
-    .type(recording.mimeType || 'application/octet-stream')
-    .header('Accept-Ranges', 'bytes')
-    .header('Cache-Control', 'private, no-store')
-    .header('X-Content-Type-Options', 'nosniff');
-
-  if (!range) {
-    return reply
-      .header('Content-Length', fileStat.size)
-      .send(createReadStream(filePath));
-  }
-
-  return reply
-    .code(206)
-    .header('Content-Length', range.end - range.start + 1)
-    .header('Content-Range', `bytes ${range.start}-${range.end}/${fileStat.size}`)
-    .send(createReadStream(filePath, { start: range.start, end: range.end }));
 });
 
 app.get('/v1/recordings/:id/clips', { preHandler: authenticate }, async (req) => {

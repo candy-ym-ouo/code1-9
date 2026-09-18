@@ -38,7 +38,8 @@ pnpm build
 - `POST /v1/auth/register`、`POST /v1/auth/login`
 - `GET/POST /v1/workspaces`
 - `POST /v1/workspaces/:id/recordings/uploads`
-- `GET /v1/recordings/:id/file`（支持 HTTP Range）
+- `POST /v1/recordings/:id/playback-ticket`（成员换取短时播放票据，默认 10 分钟有效）
+- `GET /v1/recordings/:id/file?ticket=...`（支持 HTTP Range；只接受票据或 Authorization 头，不再接受 URL 上的 JWT）
 - `GET/POST /v1/recordings/:id/clips`
 - `PATCH /v1/clips/:id`（乐观锁，版本冲突返回 409）
 - `GET/POST /v1/workspaces/:id/chapters`
@@ -49,6 +50,24 @@ pnpm build
 - `GET /v1/realtime?workspaceId=...`（WebSocket）
 
 健康检查为 `GET /health` 和 `GET /ready`。
+
+## 音频播放安全
+
+`<audio>` 标签无法携带 Authorization 头，因此播放流程分两步：
+
+1. 前端用登录 JWT 调 `POST /v1/recordings/:id/playback-ticket` 换取不透明的随机票据；
+   票据绑定具体录音和用户、存于 Redis、默认 10 分钟过期，前端在到期前自动换新。
+2. 媒体请求使用 `GET /v1/recordings/:id/file?ticket=...`，服务端逐请求校验票据与录音归属；
+   A 录音的票据不能用于 B 录音，越权 Range 请求在鉴权之前得不到任何文件信息
+   （无权限返回 404，票据无效返回 401，通过鉴权后范围非法才返回 416）。
+
+票据和 token 查询参数不会写入访问日志；媒体响应固定带 `Cache-Control: private, no-store`
+与 `Referrer-Policy: no-referrer`。
+
+服务端另有进程内的分片缓存（默认 1 MiB/片、上限 256 MiB，LRU），缓存键含录音 ID、
+文件大小、mtime 与分片索引，文件被替换后旧分片永不命中；只有长度精确的完整分片才入缓存，
+多段 Range 下载与断线重连始终按字节位置切分/拼接，不错位、不串内容。可通过
+`SEGMENT_CACHE_SEGMENT_BYTES`、`SEGMENT_CACHE_MAX_BYTES`、`PLAYBACK_TICKET_TTL_SECONDS` 调整。
 
 ## 存储
 

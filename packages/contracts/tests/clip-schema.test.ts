@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clipSchema, clipUpdateSchema } from '../src/index.js';
+import { clipSchema, clipUpdateSchema, playbackTicketCreateSchema } from '../src/index.js';
 
 describe('clipSchema', () => {
   it('applies defaults and accepts a valid range', () => {
@@ -39,5 +39,23 @@ describe('clipSchema', () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+});
+
+describe('playbackTicketCreateSchema', () => {
+  it('accepts a uuid recording id and rejects everything else', () => {
+    expect(
+      playbackTicketCreateSchema.safeParse({
+        recordingId: '123e4567-e89b-12d3-a456-426614174000',
+      }).success,
+    ).toBe(true);
+
+    expect(playbackTicketCreateSchema.safeParse({ recordingId: 'nope' }).success).toBe(false);
+    expect(
+      playbackTicketCreateSchema.safeParse({
+        recordingId: '123e4567-e89b-12d3-a456-426614174000',
+        ticket: 'attempted-injection',
+      }).success,
+    ).toBe(false);
   });
 });

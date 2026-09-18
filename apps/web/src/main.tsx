@@ -408,7 +408,13 @@ function Editor({
 }) {
   const audio = useRef<HTMLAudioElement>(null);
   const playbackEnd = useRef<number | null>(null);
+  // 记录播放票据的失效时刻与换票前的播放位置，供定时换新与 401 后续播使用。
+  const ticketExpiresAt = useRef(0);
+  const resumePosition = useRef<number | null>(null);
+  const wasPlaying = useRef(false);
+  const refreshingTicket = useRef<Promise<string> | null>(null);
   const [duration, setDuration] = useState(recording.durationMs || 0);
+  const [playbackTicket, setPlaybackTicket] = useState<string | null>(null);
   const [draft, setDraft] = useState({
     title: '新片段',
     startMs: 0,
@@ -417,9 +423,79 @@ function Editor({
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const token = localStorage.getItem('token') || '';
-  const audioUrl = `${API}/v1/recordings/${recording.id}/file?token=${encodeURIComponent(token)}`;
+  const audioUrl = playbackTicket
+    ? `${API}/v1/recordings/${recording.id}/file?ticket=${encodeURIComponent(playbackTicket)}`
+    : null;
   const timelineDuration = duration > 0 ? duration : recording.durationMs;
+
+  // 进入录音时换取短时播放票据；票据只用于媒体请求，不使用长时效 JWT 拼 URL。
+  // 多个 Range 请求同时 401 时只发起一次换票（in-flight 去重）。
+  const refreshTicket = useCallback(async () => {
+    const inFlight = refreshingTicket.current;
+    if (inFlight) return inFlight;
+
+    const request = api<{ ticket: string; expiresAt: string }>(
+      `/v1/recordings/${recording.id}/playback-ticket`,
+      { method: 'POST' },
+    )
+      .then((issued) => {
+        ticketExpiresAt.current = new Date(issued.expiresAt).getTime();
+        setPlaybackTicket(issued.ticket);
+        return issued.ticket;
+      })
+      .finally(() => {
+        refreshingTicket.current = null;
+      });
+
+    refreshingTicket.current = request;
+    return request;
+  }, [recording.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    refreshTicket()
+      .catch((ticketError) => {
+        if (!cancelled) setError((ticketError as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshTicket]);
+
+  // 在票据到期前主动换新；播放中不能直接替换 src（会中断），暂停时再切换。
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const remainingMs = ticketExpiresAt.current - Date.now();
+      if (remainingMs > 0 && remainingMs > 45_000) return;
+
+      const element = audio.current;
+      if (element && !element.paused) return;
+      void refreshTicket().catch(() => undefined);
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [refreshTicket]);
+
+  // 换新票据后：若之前因票据失效而中断，则恢复到记录的位置继续播放。
+  useEffect(() => {
+    if (!playbackTicket) return;
+    const element = audio.current;
+    if (!element || resumePosition.current === null) return;
+
+    const position = resumePosition.current;
+    resumePosition.current = null;
+    const resume = () => {
+      element.removeEventListener('loadedmetadata', resume);
+      element.currentTime = position;
+      if (wasPlaying.current) {
+        void element.play().catch(() => undefined);
+      }
+    };
+    if (Number.isFinite(element.duration) && element.duration > 0) {
+      resume();
+    } else {
+      element.addEventListener('loadedmetadata', resume);
+    }
+  }, [playbackTicket]);
 
   useEffect(() => {
     setDuration(recording.durationMs || 0);
@@ -523,11 +599,37 @@ function Editor({
       <audio
         ref={audio}
         controls
-        src={audioUrl}
+        src={audioUrl ?? undefined}
         onLoadedMetadata={(event) => {
           const nextDuration = event.currentTarget.duration * 1000;
           if (Number.isFinite(nextDuration) && nextDuration > 0) {
             setDuration(nextDuration);
+          }
+        }}
+        onPause={() => {
+          // 票据已在播放期间刷新时，暂停瞬间切换到新票据，避免后续 Range/重连用旧票据被拒。
+          const remainingMs = ticketExpiresAt.current - Date.now();
+          if (remainingMs >= 0 && remainingMs < 45_000) {
+            void refreshTicket().catch(() => undefined);
+          }
+        }}
+        onError={() => {
+          // src 尚未就绪（或已切换）时的错误无需处理。
+          if (!audioUrl) return;
+          // 票据过期会让进行中的 Range 请求收到 401：记录位置并换新票据后自动续播，
+          // 多段下载/断线重连由浏览器按 Range 重新发起，服务端按字节位置精确响应。
+          const remainingMs = ticketExpiresAt.current - Date.now();
+          if (remainingMs <= 45_000) {
+            const element = audio.current;
+            resumePosition.current = element
+              ? Number.isFinite(element.currentTime)
+                ? element.currentTime
+                : 0
+              : 0;
+            wasPlaying.current = element ? !element.paused : false;
+            void refreshTicket().catch((ticketError) => {
+              setError((ticketError as Error).message);
+            });
           }
         }}
         onTimeUpdate={(event) => {

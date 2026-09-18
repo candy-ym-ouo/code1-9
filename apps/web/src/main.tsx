@@ -40,6 +40,13 @@ type Clip = {
   version: number;
 };
 
+type PlaybackTicket = {
+  ticket: string;
+  expiresAt: string;
+  expiresInSeconds: number;
+  url: string;
+};
+
 type ApiErrorPayload = {
   error?: {
     code?: string;
@@ -408,6 +415,11 @@ function Editor({
 }) {
   const audio = useRef<HTMLAudioElement>(null);
   const playbackEnd = useRef<number | null>(null);
+  const ticketUrl = useRef<string | null>(null);
+  const audioSrcRef = useRef<string | null>(null);
+  const resumePlayback = useRef<{ time: number; play: boolean } | null>(null);
+  const refreshTicket = useRef<(() => void) | null>(null);
+  const [audioSrc, setAudioSrc] = useState<string | null>(null);
   const [duration, setDuration] = useState(recording.durationMs || 0);
   const [draft, setDraft] = useState({
     title: '新片段',
@@ -417,9 +429,64 @@ function Editor({
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const token = localStorage.getItem('token') || '';
-  const audioUrl = `${API}/v1/recordings/${recording.id}/file?token=${encodeURIComponent(token)}`;
   const timelineDuration = duration > 0 ? duration : recording.durationMs;
+
+  const applyAudioSrc = (url: string | null) => {
+    audioSrcRef.current = url;
+    setAudioSrc(url);
+  };
+
+  // 短时播放票据：定期换新；仅当音频元素进入错误态（票据过期、断线）
+  // 时才切换 src，并从断点恢复播放，避免多段请求错位或中断。
+  useEffect(() => {
+    let cancelled = false;
+    let timer = 0;
+    ticketUrl.current = null;
+    resumePlayback.current = null;
+    applyAudioSrc(null);
+
+    const recoverIfNeeded = () => {
+      const element = audio.current;
+      const next = ticketUrl.current;
+      if (!element || !next || next === audioSrcRef.current || !element.error) return;
+      resumePlayback.current = {
+        time: element.currentTime || 0,
+        play: !element.paused && !element.ended,
+      };
+      applyAudioSrc(next);
+    };
+
+    const refresh = async () => {
+      try {
+        const ticket = await api<PlaybackTicket>(
+          `/v1/recordings/${recording.id}/playback-ticket`,
+          { method: 'POST' },
+        );
+        if (cancelled) return;
+        ticketUrl.current = `${API}${ticket.url}`;
+        if (!audioSrcRef.current) {
+          applyAudioSrc(ticketUrl.current);
+        } else {
+          recoverIfNeeded();
+        }
+        const ttlMs = Math.max(1_000, new Date(ticket.expiresAt).getTime() - Date.now());
+        timer = window.setTimeout(() => void refresh(), Math.max(5_000, ttlMs / 2));
+      } catch (ticketError) {
+        if (cancelled) return;
+        setError((ticketError as Error).message);
+        timer = window.setTimeout(() => void refresh(), 10_000);
+      }
+    };
+
+    refreshTicket.current = () => void refresh();
+    void refresh();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      refreshTicket.current = null;
+    };
+  }, [recording.id]);
 
   useEffect(() => {
     setDuration(recording.durationMs || 0);
@@ -520,27 +587,44 @@ function Editor({
         <span className="status">READY</span>
       </div>
 
-      <audio
-        ref={audio}
-        controls
-        src={audioUrl}
-        onLoadedMetadata={(event) => {
-          const nextDuration = event.currentTarget.duration * 1000;
-          if (Number.isFinite(nextDuration) && nextDuration > 0) {
-            setDuration(nextDuration);
-          }
-        }}
-        onTimeUpdate={(event) => {
-          const end = playbackEnd.current;
-          if (end !== null && event.currentTarget.currentTime >= end) {
-            event.currentTarget.pause();
+      {audioSrc ? (
+        <audio
+          ref={audio}
+          controls
+          src={audioSrc}
+          onLoadedMetadata={(event) => {
+            const element = event.currentTarget;
+            const nextDuration = element.duration * 1000;
+            if (Number.isFinite(nextDuration) && nextDuration > 0) {
+              setDuration(nextDuration);
+            }
+            const pending = resumePlayback.current;
+            if (pending) {
+              resumePlayback.current = null;
+              element.currentTime = pending.time;
+              if (pending.play) {
+                void element.play().catch(() => undefined);
+              }
+            }
+          }}
+          onError={() => {
+            // 票据过期或断线：立即换新票据并切换到新地址，从断点恢复
+            refreshTicket.current?.();
+          }}
+          onTimeUpdate={(event) => {
+            const end = playbackEnd.current;
+            if (end !== null && event.currentTarget.currentTime >= end) {
+              event.currentTarget.pause();
+              playbackEnd.current = null;
+            }
+          }}
+          onEnded={() => {
             playbackEnd.current = null;
-          }
-        }}
-        onEnded={() => {
-          playbackEnd.current = null;
-        }}
-      />
+          }}
+        />
+      ) : (
+        <p className="empty">正在获取播放票据...</p>
+      )}
 
       <div className="timeline">
         <div className="ruler">
